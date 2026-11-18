@@ -1,6 +1,7 @@
 # OwO 平台影音｜小幫手 v1.0
 
 此版本包含完整前端、Cloudflare Worker、YouTube Media Session 修正，以及同源 FFmpeg WebAssembly 資源。
+https://leonoao.github.io/OwO.MO.Downloader/
 
 ## YouTube Media Session 修正
 
