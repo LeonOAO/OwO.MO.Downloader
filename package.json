@@ -1,0 +1,19 @@
+{
+  "name": "owo-mo-downloader-worker",
+  "version": "1.8.1",
+  "description": "WEB_SAFARI HLS 與一般 Client 優先，ANDROID_VR 備援 1，VISIONOS 備援 2。",
+  "main": "app.js",
+  "scripts": {
+    "build:worker": "npm run patch:googlevideo && esbuild WorkerSource.js --bundle --format=esm --platform=browser --target=es2022 --minify --outfile=worker.js",
+    "patch:googlevideo": "node PatchGoogleVideo.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "esbuild": "^0.25.10",
+    "googlevideo": "^4.1.1"
+  },
+  "private": true
+}

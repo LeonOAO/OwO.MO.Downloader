@@ -1,0 +1,1001 @@
+"use strict";
+const $ = id => document.getElementById(id);
+const state = { formats: [], mode: "hq", ffmpeg: null, ffmpegLoaded: false, ffmpegLoading: null, busy: false, videoId: "", baseReady: false, platform: "youtube", fbCookie: "", igCookie: "", thCookie: "", ytCookie: "", ytMediaSessionId: "" };
+const APP_VERSION = "v1.8.1";
+const FFMPEG_MODULE_URL = new URL("./FFmpeg/ffmpeg/index.js", import.meta.url).href;
+const FFMPEG_CLASS_WORKER_URL = new URL("./FFmpeg/ffmpeg/worker.js", import.meta.url).href;
+const FFMPEG_CORE_BASE = new URL("./FFmpeg/core", import.meta.url).href;
+const MAX_BROWSER_WORK_BYTES = 700 * 1024 * 1024;
+const YOUTUBE_DOWNLOAD_CHUNK_BYTES = 5 * 1024 * 1024;
+const YOUTUBE_AUTO_RETRY_DELAY_MS = 5000;
+const YOUTUBE_AUTO_RETRY_CODES = new Set(["YOUTUBE_PLAYER_RESPONSE_MISSING","YOUTUBE_RATE_LIMITED","YOUTUBE_PAGE_UNAVAILABLE","AUTH_REQUIRED","NO_MEDIA_ADDRESS"]);
+const DEFAULT_WORKER_URL = "https://owo-mo-downloader-api.kkwan812.workers.dev";
+
+function normalizeLogMessage(message) {
+  const text = String(message ?? "").trim();
+  if (!text) return "【系統】未提供紀錄內容。";
+  if (/^【[^】]+】/.test(text)) return text;
+  const rules = [
+    [/^開始解析影片\s+ID[：:]\s*(.+)$/i, match => `【開始解析影片】ID：${match[1]}`],
+    [/^處理失敗[：:]\s*(.+)$/i, match => `【處理失敗】${match[1]}`],
+    [/^解析失敗[：:]\s*(.+)$/i, match => `【解析失敗】${match[1]}`],
+    [/^下載失敗[：:]\s*(.+)$/i, match => `【下載失敗】${match[1]}`],
+    [/^已辨識平台[：:]\s*(.+)$/i, match => `【平台辨識】${match[1]}`],
+    [/^開始(.+)$/i, match => `【開始執行】${match[1]}`],
+    [/^(.+)$/s, match => `【系統】${match[1]}`]
+  ];
+  for (const [pattern, formatter] of rules) {
+    const match = text.match(pattern);
+    if (match) return formatter(match);
+  }
+  return `【系統】${text}`;
+}
+function log(message) {
+  const time = new Date().toLocaleTimeString("zh-TW", { hour12: false });
+  const box = $("log");
+  if (box.textContent === "尚未執行。") box.textContent = "";
+  box.textContent += `[${time}] ${normalizeLogMessage(message)}\n`;
+  box.scrollTop = box.scrollHeight;
+}
+function status(message, kind = "idle") {
+  const node = $("status");
+  node.className = `status ${kind}`;
+  node.querySelector("span:last-child").textContent = message;
+}
+function setProgress(percent, text) {
+  const value = Math.max(0, Math.min(100, Math.round(percent)));
+  $("progressBox").classList.remove("hidden");
+  $("progressValue").textContent = `${value}%`;
+  $("progressBar").style.width = `${value}%`;
+  $("progressText").textContent = text;
+}
+function videoId(value) {
+  try {
+    const url = new URL(value.trim());
+    const host = url.hostname.toLowerCase().replace(/^www\./, "");
+    if (host === "youtu.be") return url.pathname.split("/").filter(Boolean)[0] || null;
+    if (["youtube.com", "m.youtube.com", "music.youtube.com"].includes(host)) {
+      if (url.pathname === "/watch") return url.searchParams.get("v");
+      return (url.pathname.match(/^\/(?:shorts|embed|live)\/([^/?#]+)/) || [])[1] || null;
+    }
+    return null;
+  } catch { return null; }
+}
+function detectPlatform(value) {
+  try {
+    const host = new URL(value.trim()).hostname.toLowerCase().replace(/^www\./, "");
+    if (["youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"].includes(host)) return "youtube";
+    if (["facebook.com", "m.facebook.com", "web.facebook.com", "fb.watch"].includes(host)) return "facebook";
+    if (["instagram.com", "m.instagram.com", "instagr.am"].includes(host)) return "instagram";
+    if (["threads.com", "threads.net"].includes(host)) return "threads";
+    return "";
+  } catch { return ""; }
+}
+
+function platformRequestHeaders(platform = state.platform) {
+  const headers = { "Cache-Control": "no-cache" };
+  if (platform === "youtube" && state.ytCookie) headers["X-YT-Session"] = state.ytCookie;
+  if (platform === "facebook" && state.fbCookie) headers["X-FB-Session"] = state.fbCookie;
+  if (platform === "instagram" && state.igCookie) headers["X-IG-Session"] = state.igCookie;
+  if (platform === "threads") {
+    if (state.thCookie) headers["X-TH-Session"] = state.thCookie;
+    else if (state.igCookie) headers["X-IG-Session"] = state.igCookie;
+  }
+  return headers;
+}
+
+function setYtSessionUi(applied, message = "") {
+  const badge = $("ytSessionBadge");
+  badge.textContent = applied ? "此分頁已套用" : "未套用";
+  badge.className = `session-badge ${applied ? "on" : "off"}`;
+  document.querySelector(".yt-session-card").classList.toggle("applied", applied);
+  if (message) $("ytSessionHelp").textContent = message;
+}
+function applyYtCookie() {
+  const value = normalizeCookieInput($("ytCookie").value);
+  if (!value || !/(?:^|;\s*)(?:SAPISID|__Secure-3PAPISID)=/i.test(value)) {
+    setYtSessionUi(false, "格式不完整，至少需要 SAPISID 或 __Secure-3PAPISID。Cookie 不會寫入瀏覽器儲存空間。");
+    status("YT_COOKIE 格式不完整。", "error");
+    return;
+  }
+  state.ytCookie = value;
+  $("ytCookie").value = "";
+  setYtSessionUi(true, "已套用至目前分頁；重新整理或關閉分頁後自動清除，執行紀錄不顯示內容。");
+  status("YouTube 登入工作階段已套用至目前分頁。", "success");
+  log("YouTube 登入工作階段已套用至目前分頁（內容已隱藏）。");
+}
+function clearYtCookie() {
+  state.ytCookie = "";
+  $("ytCookie").value = "";
+  $("ytCookie").type = "password";
+  $("toggleYtCookie").textContent = "顯示";
+  setYtSessionUi(false, "🔒 隱私保護：Cookie 僅暫存於當前分頁，重新整理或關閉後將自動清除，不留任何紀錄。");
+  status("YouTube 登入工作階段已清除。", "idle");
+  log("YouTube 登入工作階段已清除。");
+}
+function setFbSessionUi(applied, message = "") {
+  const badge = $("fbSessionBadge");
+  badge.textContent = applied ? "此分頁已套用" : "未套用";
+  badge.className = `session-badge ${applied ? "on" : "off"}`;
+  document.querySelector(".session-card").classList.toggle("applied", applied);
+  if (message) $("fbSessionHelp").textContent = message;
+}
+function normalizeCookieInput(value) {
+  return String(value || "").trim().replace(/^cookie\s*:\s*/i, "").replace(/^['"]|['"]$/g, "").trim();
+}
+function applyFbCookie() {
+  const value = normalizeCookieInput($("fbCookie").value);
+  if (!value || !/(?:^|;\s*)c_user=/.test(value) || !/(?:^|;\s*)xs=/.test(value)) {
+    setFbSessionUi(false, "格式不完整，至少需要 c_user 與 xs。Cookie 不會保存至瀏覽器儲存空間。");
+    status("FB_COOKIE 格式不完整，請確認包含 c_user 與 xs。", "error");
+    return;
+  }
+  state.fbCookie = value;
+  $("fbCookie").value = "";
+  setFbSessionUi(true, "已套用至目前分頁。重新整理或關閉分頁後自動清除；執行紀錄不會顯示 Cookie。 ");
+  status("Facebook 登入工作階段已套用至目前分頁。", "success");
+  log("Facebook 登入工作階段已套用至目前分頁（內容已隱藏）。");
+}
+function clearFbCookie() {
+  state.fbCookie = "";
+  $("fbCookie").value = "";
+  $("fbCookie").type = "password";
+  $("toggleFbCookie").textContent = "顯示";
+  setFbSessionUi(false, "Cookie 已從目前分頁記憶體清除，不會影響 Cloudflare Secret。 ");
+  status("Facebook 登入工作階段已從目前分頁清除。", "idle");
+  log("Facebook 登入工作階段已從目前分頁清除。");
+}
+function setSocialSessionUi(platform, applied, message = "") {
+  const prefix = platform === "instagram" ? "ig" : "th";
+  const badge = $(`${prefix}SessionBadge`);
+  badge.textContent = applied ? "此分頁已套用" : "未套用";
+  badge.className = `session-badge ${applied ? "on" : "off"}`;
+  document.querySelector(`.${prefix}-session-card`).classList.toggle("applied", applied);
+  if (message) $(`${prefix}SessionHelp`).textContent = message;
+}
+function applySocialCookie(platform) {
+  const prefix = platform === "instagram" ? "ig" : "th";
+  const value = normalizeCookieInput($(`${prefix}Cookie`).value);
+  const valid = platform === "instagram" ? /(?:^|;\s*)sessionid=/.test(value) : value.length >= 20;
+  if (!valid) {
+    setSocialSessionUi(platform, false, platform === "instagram" ? "格式不完整，Instagram Cookie 至少需要 sessionid。" : "Threads Cookie 格式過短，請貼上完整 Header String。");
+    status(`${platform === "instagram" ? "Instagram" : "Threads"} Cookie 格式不完整。`, "error");
+    return;
+  }
+  state[platform === "instagram" ? "igCookie" : "thCookie"] = value;
+  $(`${prefix}Cookie`).value = "";
+  setSocialSessionUi(platform, true, "已套用至目前分頁，重新整理或關閉分頁後會自動清除。");
+  status(`${platform === "instagram" ? "Instagram" : "Threads"} 登入工作階段已套用。`, "success");
+}
+function clearSocialCookie(platform) {
+  const prefix = platform === "instagram" ? "ig" : "th";
+  state[platform === "instagram" ? "igCookie" : "thCookie"] = "";
+  $(`${prefix}Cookie`).value = "";
+  setSocialSessionUi(platform, false, "Cookie 已從目前分頁記憶體清除。");
+  status(`${platform === "instagram" ? "Instagram" : "Threads"} 登入工作階段已清除。`, "idle");
+}
+async function analyzeSocial(url, platform) {
+  const label = platform === "instagram" ? "Instagram" : "Threads";
+  log(`已辨識平台：${label}，開始解析影片頁面。`);
+  const response = await fetch(endpoint(`/${platform}`, { url }), { cache: "no-store", headers: platformRequestHeaders(platform) });
+  const data = await response.json().catch(() => ({}));
+  if (Array.isArray(data.steps)) data.steps.forEach(log);
+  if (!response.ok) throw Error(data.error || data.note || `Worker 回傳 HTTP ${response.status}。`);
+  const formats = Array.isArray(data.formats) ? data.formats : [];
+  if (data.canonicalUrl) log(`${label} 固定內容網址：${data.canonicalUrl}`);
+  if (!formats.length) throw Error(data.note || `目前沒有取得 ${label} 影片格式。`);
+  state.formats = mergeFormats([], formats);
+  state.videoId = data.id || platform;
+  state.baseReady = true;
+  applyVideoData(data, state.videoId);
+  setMode(lists().videoOnly.length && lists().audioOnly.length ? "hq" : "direct");
+  status(`${label} 解析完成，共取得「${state.formats.length}」個影片格式。`, "success");
+}
+function endpoint(path, params = {}) {
+  const base = $("worker").value.trim().replace(/\/$/, "");
+  if (!base) throw Error("請先在進階設定輸入 Cloudflare Worker 網址。");
+  const url = new URL(base + path);
+  Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+  return url.href;
+}
+function qualityNumber(format) {
+  const match = String(format.quality || "").match(/\d+/);
+  return match ? Number(match[0]) : 0;
+}
+function bytes(format) { return Number(format?.contentLength || 0); }
+function humanBytes(value) {
+  if (!value) return "大小未知";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let size = value, unit = 0;
+  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; }
+  return `${size.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+}
+function lists() {
+  const videoOnly = state.formats.filter(f => f.kind === "僅視訊").sort((a,b) => qualityNumber(b)-qualityNumber(a) || (b.bitrate||0)-(a.bitrate||0));
+  const audioOnly = state.formats.filter(f => f.kind === "僅音訊").sort((a,b) => (b.bitrate||0)-(a.bitrate||0));
+  const muxed = state.formats.filter(f => f.kind === "影音合一").sort((a,b) => qualityNumber(b)-qualityNumber(a));
+  return { videoOnly, audioOnly, muxed };
+}
+function appendOption(select, format, label) {
+  const option = document.createElement("option");
+  option.value = String(state.formats.indexOf(format));
+  option.textContent = label;
+  select.append(option);
+}
+function populate() {
+  const { videoOnly, audioOnly, muxed } = lists();
+  const video = $("videoFormat"), audio = $("audioFormat"), direct = $("directFormat");
+  video.replaceChildren(); audio.replaceChildren(); direct.replaceChildren();
+  videoOnly.forEach(f => appendOption(video, f, displayFormat(f)));
+  audioOnly.forEach(f => appendOption(audio, f, displayFormat(f, true)));
+  muxed.forEach(f => appendOption(direct, f, displayFormat(f)));
+  const hqReady = videoOnly.length && audioOnly.length;
+  const directReady = muxed.length;
+  if (!hqReady && directReady) setMode("direct");
+  else setMode("hq");
+  $("formatNote").textContent = hqReady
+    ? "高畫質模式會分別下載視訊與音訊，再以 ffmpeg.wasm 在本機合併。檔案越大，手機記憶體需求越高。"
+    : directReady ? "目前沒有取得分離式高畫質來源，已切換為完整影片下載。" : "目前沒有可下載的格式。";
+  updateButton();
+}
+function setMode(mode) {
+  state.mode = mode;
+  document.querySelectorAll(".mode").forEach(button => button.classList.toggle("active", button.dataset.mode === mode));
+  $("hqOptions").classList.toggle("hidden", mode !== "hq");
+  $("directOptions").classList.toggle("hidden", mode !== "direct");
+  updateButton();
+}
+function selected(id) { return state.formats[Number($(id).value)]; }
+function updateButton() {
+  const { videoOnly, audioOnly, muxed } = lists();
+  const ready = state.mode === "hq" ? videoOnly.length && audioOnly.length : muxed.length;
+  $("download").disabled = !ready || state.busy;
+  $("download").querySelector("span").textContent = "下載影片 MP4";
+  const audioButton = $("extractAudio");
+  const mp3Button = $("convertMp3");
+  const wavButton = $("convertWav");
+  const mp3Options = $("mp3Options");
+  const completeVideoReady = state.mode === "direct" && muxed.length > 0;
+  audioButton.classList.toggle("hidden", !completeVideoReady);
+  mp3Button.classList.toggle("hidden", !completeVideoReady);
+  wavButton.classList.toggle("hidden", !completeVideoReady);
+  mp3Options.classList.toggle("hidden", !completeVideoReady);
+  audioButton.disabled = !completeVideoReady || state.busy;
+  mp3Button.disabled = !completeVideoReady || state.busy;
+  wavButton.disabled = !completeVideoReady || state.busy;
+  $("mp3Bitrate").disabled = !completeVideoReady || state.busy;
+}
+function decodeBase64UrlJson(value) {
+  try {
+    const normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+    return JSON.parse(atob(padded));
+  } catch { return null; }
+}
+function explicitMediaIdentity(format) {
+  for (const key of ["mediaId", "media_id", "videoId", "video_id", "pk", "assetId", "asset_id"]) {
+    const value = format && format[key];
+    if (value !== undefined && value !== null && String(value).trim()) return `${key}:${String(value).trim()}`;
+  }
+  if (Number.isInteger(format?.mediaIndex)) return `index:${format.mediaIndex}`;
+  if (Number.isInteger(format?.carouselIndex)) return `carousel:${format.carouselIndex}`;
+  if (!format?.url) return "";
+  try {
+    const url = new URL(format.url);
+    for (const key of ["media_id", "mediaid", "video_id", "videoid", "asset_id"]) {
+      const value = url.searchParams.get(key);
+      if (value && /^[A-Za-z0-9_-]{5,}$/.test(value)) return `${key}:${value}`;
+    }
+    const efg = decodeBase64UrlJson(url.searchParams.get("efg"));
+    const efgId = efg && (efg.video_id || efg.media_id || efg.asset_id);
+    if (efgId) return `efg:${efgId}`;
+  } catch {}
+  return "";
+}
+function normalizedKind(format) {
+  const kind = String(format?.kind || "").trim().toLowerCase();
+  if (["僅視訊", "video_only", "video-only"].includes(kind)) return "僅視訊";
+  if (["僅音訊", "audio_only", "audio-only"].includes(kind)) return "僅音訊";
+  return "影音合一";
+}
+function qualityBucket(format) {
+  const height = Number(format?.height || qualityNumber(format) || 0);
+  if (height) return `${height}p`;
+  const label = String(format?.quality || "原始畫質").trim().toLowerCase();
+  if (/^hd$|高畫質/.test(label)) return "hd";
+  if (/^sd$|標準畫質/.test(label)) return "sd";
+  return label || "original";
+}
+function codecFamily(format) {
+  const codec = String(format?.codec || format?.codecs || "").toLowerCase();
+  if (/av01|av1/.test(codec)) return "av1";
+  if (/vp9|vp09/.test(codec)) return "vp9";
+  if (/avc1|h264/.test(codec)) return "h264";
+  if (/hevc|h265|hvc1/.test(codec)) return "hevc";
+  if (/opus/.test(codec)) return "opus";
+  if (/mp4a|aac/.test(codec)) return "aac";
+  return codec || "unknown";
+}
+function strictFormatKey(format) {
+  const platform = state.platform;
+  const identity = explicitMediaIdentity(format);
+  const kind = normalizedKind(format);
+  const quality = qualityBucket(format);
+  const container = String(format?.container || "bin").toLowerCase();
+  const codec = codecFamily(format);
+  if (platform === "youtube") {
+    return `youtube:${format.itag || identity || "track"}:${kind}:${quality}:${container}:${codec}`;
+  }
+  if (identity) return `${platform}:${identity}:${kind}:${quality}:${container}:${codec}`;
+  // Meta results without a trustworthy media identity are ambiguous. Collapse
+  // equal-quality results into one item instead of treating CDN paths as videos.
+  return `${platform}:unidentified:${kind}:${quality}:${container}:${codec}`;
+}
+function formatPreference(format) {
+  const direct = format?.url ? 1 : 0;
+  const height = Number(format?.height || qualityNumber(format) || 0);
+  const width = Number(format?.width || 0);
+  const pixels = height * (width || Math.round(height * 16 / 9));
+  const bitrate = Number(format?.bitrate || 0);
+  const length = bytes(format);
+  const metadata = [format?.mediaId, format?.mediaIndex, format?.width, format?.height, format?.codec].filter(value => value !== undefined && value !== null && value !== "").length;
+  return direct * 1e24 + pixels * 1e15 + bitrate * 1e6 + length * 10 + metadata;
+}
+function annotateMediaGroups(formats) {
+  if (state.platform === "youtube") return formats.map(format => ({ ...format, mediaIndex: 1, mediaCount: 1 }));
+  const identities = [];
+  for (const format of formats) {
+    const identity = explicitMediaIdentity(format);
+    if (identity && !identities.includes(identity)) identities.push(identity);
+  }
+  // Only show video numbering when two or more explicit media identities exist.
+  const count = identities.length > 1 ? identities.length : 1;
+  return formats.map(format => {
+    const identity = explicitMediaIdentity(format);
+    const index = count > 1 && identity ? identities.indexOf(identity) + 1 : 1;
+    return { ...format, kind: normalizedKind(format), mediaIdentity: identity, mediaIndex: index, mediaCount: count };
+  });
+}
+function mergeFormats(current, incoming) {
+  const map = new Map();
+  for (const raw of [...current, ...incoming]) {
+    const format = { ...raw, kind: normalizedKind(raw) };
+    const key = strictFormatKey(format);
+    const existing = map.get(key);
+    if (!existing || formatPreference(format) > formatPreference(existing)) map.set(key, format);
+  }
+  return annotateMediaGroups([...map.values()]);
+}
+function mediaPrefix(format) {
+  return Number(format?.mediaCount || 1) > 1 ? `影片 ${format.mediaIndex} · ` : "";
+}
+function displayFormat(format, audio = false) {
+  const quality = audio ? `${Math.round((format.bitrate || 0) / 1000) || "未知"} kbps` : format.quality;
+  const sourceLabel = format.protocol === "hls" ? " · WEB_SAFARI HLS" : "";
+  return `${mediaPrefix(format)}${quality} · ${String(format.container || "bin").toUpperCase()} · ${humanBytes(bytes(format))}${sourceLabel}`;
+}
+function safeFileToken(value, fallback = "media") {
+  const cleaned = String(value || "").trim().replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  return cleaned || fallback;
+}
+function mediaFileStem(format) {
+  const index = Number(format?.mediaCount || 1) > 1 ? `-video-${String(format.mediaIndex).padStart(2, "0")}` : "";
+  return `${safeFileToken(state.platform)}${index}-${safeFileToken(format.quality, "original")}`;
+}
+
+function applyVideoData(data, id) {
+  const details = data || {};
+  $("videoInfo").classList.remove("hidden");
+  $("downloadPanel").classList.remove("hidden");
+  $("title").textContent = details.title || `${state.platform} 影片`;
+  $("thumbnail").src = details.thumbnail || "";
+  $("thumbnail").alt = details.title ? `${details.title} 縮圖` : "影片縮圖";
+  const length = details.lengthSeconds ? ` · ${details.lengthSeconds} 秒` : "";
+  $("meta").textContent = `影片 ID：${id || "未知"} · 來源：${String(details.source || state.platform).toUpperCase()} · 可用格式：${state.formats.length} 個${length}`;
+  populate();
+}
+function wait(milliseconds) { return new Promise(resolve => setTimeout(resolve, milliseconds)); }
+async function requestYoutubeAll(id, attempts = 3) {
+  let lastResponse = null, lastData = {};
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const response = await fetch(endpoint("/youtube", { id, mode: "all", nonce: `${Date.now()}-${attempt}` }), { cache: "no-store", headers: platformRequestHeaders("youtube") });
+    const data = await response.json().catch(() => ({}));
+    if (Array.isArray(data.steps)) data.steps.forEach(log);
+    lastResponse = response; lastData = data;
+    if (response.ok) return { response, data };
+    const retryable = [429, 502, 503, 504].includes(response.status);
+    if (!retryable || attempt === attempts) break;
+    const delay = attempt * 1200;
+    log(`【單一工作階段】HTTP ${response.status}，等待 ${delay} 毫秒後進行第 ${attempt + 1}/${attempts} 次完整嘗試。`);
+    await wait(delay);
+  }
+  return { response: lastResponse, data: lastData };
+}
+async function analyzeYoutube(id) {
+  log(`【開始解析影片】ID：${id}`);
+  log("【單一工作階段】基本格式與高畫質 Client 共用同一次 watch 頁面、API Key、Visitor Data 與 Player Response。");
+  const { response, data } = await requestYoutubeAll(id, 3);
+  if (!response || !response.ok) { const error=new Error(data.error||data.note||`YouTube 單一工作階段回傳 HTTP ${response?.status||"未知"}。`); error.code=String(data.code||"YOUTUBE_ANALYSIS_FAILED"); throw error; }
+  state.ytMediaSessionId = String(data.mediaSessionId || "");
+  log(`【版本】前端：${APP_VERSION}；Worker：${data.version || "未知"}；Media Session：${state.ytMediaSessionId ? state.ytMediaSessionId.slice(0, 8) : "未建立"}。`);
+  state.formats = mergeFormats([], Array.isArray(data.formats) ? data.formats : []);
+  if (!state.formats.length) { const error=new Error(data.note||data.error||"目前沒有取得可下載的 YouTube 格式。"); error.code=String(data.code||"NO_MEDIA_ADDRESS"); throw error; }
+  state.videoId = id; state.baseReady = true; applyVideoData(data, id);
+  const { videoOnly, audioOnly, muxed } = lists();
+  const hasHqPair = videoOnly.length > 0 && audioOnly.length > 0;
+  setMode(hasHqPair ? "hq" : "direct");
+  if (hasHqPair) {
+    status(`YouTube 單一工作階段解析完成，共取得「${state.formats.length}」個格式。`, "success");
+    log(`【高畫質】已取得分離視訊「${videoOnly.length}」個與音訊「${audioOnly.length}」個。`);
+  } else {
+    status(`已取得「${muxed.length || state.formats.length}」個基本影片格式；本次沒有額外高畫質來源。`, "success");
+    log("【基本格式保留】本次沒有取得完整高畫質配對，基本格式仍可直接下載。");
+  }
+}
+function youtubeRetryLimit(){const input=$("youtubeRetryLimit");const parsed=Number.parseInt(input?.value||"3",10);const value=Number.isFinite(parsed)?Math.max(1,Math.min(99,parsed)):3;if(input)input.value=String(value);return value;}
+function cleanRetryReason(value){return String(value||"解析失敗").trim().replace(/[。．.!！?？；;：:]+$/u,"");}
+function isYoutubeAutoRetryError(error){const code=String(error?.code||"");const message=String(error?.message||error||"");return YOUTUBE_AUTO_RETRY_CODES.has(code)||message.includes("WATCH 重試已達上限")||message.includes("所有 YouTube 解析來源均未取得可用的媒體位址");}
+async function analyzeYoutubeWithAutoRetry(id){const retryLimit=youtubeRetryLimit();let retryCount=0;while(true){try{await analyzeYoutube(id);if(retryCount>0)log(`【YouTube 自動重試】第 ${retryCount} 次重新解析成功，已停止自動重試。`);return;}catch(error){if(!$("youtubeAutoRetry")?.checked||!isYoutubeAutoRetryError(error)||retryCount>=retryLimit){if($("youtubeAutoRetry")?.checked&&isYoutubeAutoRetryError(error)&&retryCount>=retryLimit)log(`【YouTube 自動重試失敗】已達重試上限，共完成 ${retryCount} 次重新解析。`);throw error;}retryCount++;const reason=cleanRetryReason(error.message||error);log(`【YouTube 自動重試】等待 5 秒後，嘗試「第 ${retryCount}/${retryLimit} 次」重新解析；原因：${reason}。`);status(`YouTube 解析失敗，等待 5 秒後，嘗試「第 ${retryCount}/${retryLimit} 次」重新解析…`,"working");await wait(YOUTUBE_AUTO_RETRY_DELAY_MS);log(`【YouTube 自動重試】開始嘗試「第 ${retryCount}/${retryLimit} 次」完整重新解析。`);status(`正在嘗試「第 ${retryCount}/${retryLimit} 次」YouTube 自動重新解析…`,"working");}}}
+
+async function analyze() {
+  if (state.busy) return;
+  $("log").textContent = "尚未執行。";
+  const value = $("youtubeUrl").value.trim();
+  const platform = detectPlatform(value);
+  if (!platform) { status("請貼上支援的 YouTube、Facebook、Instagram 或 Threads 網址。", "error"); return; }
+  try {
+    state.busy = true; state.platform = platform; state.formats = []; state.baseReady = false; state.ytMediaSessionId = ""; updateButton();
+    $("videoInfo").classList.add("hidden");
+    $("downloadPanel").classList.add("hidden");
+    status("正在解析影片頁面…", "working");
+    if (platform === "youtube") {
+      const id = videoId(value); if (!id) throw Error("無法辨識 YouTube 影片 ID。");
+      await analyzeYoutubeWithAutoRetry(id);
+    } else if (platform === "facebook") {
+      log("已辨識平台：Facebook，開始解析影片頁面。");
+      const response = await fetch(endpoint("/facebook", { url: value }), { cache: "no-store", headers: platformRequestHeaders("facebook") });
+      const data = await response.json().catch(() => ({}));
+      if (Array.isArray(data.steps)) data.steps.forEach(log);
+      if (!response.ok) throw Error(data.error || data.note || `Worker 回傳 HTTP ${response.status}。`);
+      state.formats = mergeFormats([], Array.isArray(data.formats) ? data.formats : []);
+      if (!state.formats.length) throw Error(data.note || "目前沒有取得 Facebook 影片格式。");
+      state.videoId = data.id || "facebook"; state.baseReady = true; applyVideoData(data, state.videoId);
+      setMode(lists().videoOnly.length && lists().audioOnly.length ? "hq" : "direct");
+      status(`Facebook 解析完成，共取得「${state.formats.length}」個格式。`, "success");
+    } else await analyzeSocial(value, platform);
+  } catch (error) {
+    status(String(error.message || error), "error"); log(`解析失敗：${String(error.message || error)}`);
+  } finally { state.busy = false; updateButton(); }
+}
+function mediaEndpoint(format, download = false) {
+  if (state.platform === "youtube") {
+    return endpoint("/media", {
+      id: state.videoId,
+      itag: format.activeItag || format.itag,
+      source: format.source || "ANDROID",
+      generatedAt: format.generatedAt || "",
+      sessionId: format.sessionId || state.ytMediaSessionId || "",
+      url: format.url || "",
+      refreshApiKey: format.refreshApiKey || "",
+      refreshVisitorData: format.refreshVisitorData || "",
+      quality: format.quality || "",
+      height: format.height || qualityNumber(format) || "",
+      fps: format.fps || "",
+      codec: format.codec || "",
+      kind: format.kind || "",
+      ext: format.container || "bin",
+      download: download ? "1" : "0"
+    });
+  }
+  if (state.platform === "facebook") return endpoint("/facebook-media", { url: format.url });
+  return endpoint("/social-media", { url: format.url, platform: state.platform });
+}
+function contentRangeInfo(value) {
+  const match = String(value || "").match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+  return match ? { start:Number(match[1]), end:Number(match[2]), total:match[3]==="*"?0:Number(match[3]) } : null;
+}
+function hqSegmentEndpoint(format, rangeStart, rangeEnd) {
+  return endpoint("/youtube-hq-segment", {
+    id: state.videoId,
+    itag: format.activeItag || format.itag,
+    source: format.source || "ANDROID_VR",
+    apiKey: format.refreshApiKey || "",
+    visitorData: format.refreshVisitorData || "",
+    sessionId: format.sessionId || state.ytMediaSessionId || "",
+    start: rangeStart,
+    end: rangeEnd,
+    kind: normalizedKind(format),
+    height: format.height || qualityNumber(format) || 0,
+    fps: format.fps || 0,
+    codec: format.codec || "",
+    container: format.container || "",
+    total: format.contentLength || 0
+  });
+}
+async function fetchYoutubeMediaInChunks(format, label, start, end) {
+  const total = Number(format.contentLength || 0);
+  if (!Number.isFinite(total) || total <= 0) throw new Error(`${label}缺少可靠的完整媒體大小。`);
+  if (total > MAX_BROWSER_WORK_BYTES) throw new Error(`${label}超過瀏覽器安全處理上限。`);
+  const chunks=[];
+  let received=0, offset=0, index=0;
+  const count=Math.ceil(total/YOUTUBE_DOWNLOAD_CHUNK_BYTES);
+  const retryLimit=youtubeRetryLimit();
+  log(`【高畫質同工作階段】${label}總大小 ${humanBytes(total)}，每段上限 5 MiB，共 ${count} 段。`);
+  while(offset<total){
+    const rangeEnd=Math.min(total-1,offset+YOUTUBE_DOWNLOAD_CHUNK_BYTES-1);
+    const requestedRange=`bytes=${offset}-${rangeEnd}`;
+    index++;
+    let attempt=0, response=null;
+    while(attempt<=retryLimit){
+      if(attempt>0){
+        log(`【高畫質區段重試】保留 ${received>0?humanBytes(received):"0 bytes"}，等待 5 秒後重試第 ${index}/${count} 段。`);
+        await wait(YOUTUBE_AUTO_RETRY_DELAY_MS);
+      }
+      attempt++;
+      response=await fetch(hqSegmentEndpoint(format,offset,rangeEnd),{cache:"no-store",headers:platformRequestHeaders("youtube")});
+      if(response.ok) break;
+      const body=await response.json().catch(()=>({}));
+      if(Array.isArray(body.steps)) body.steps.forEach(log);
+      if(![409,422,429,502,503,504].includes(response.status)||attempt>retryLimit) break;
+    }
+    if(!response?.ok){
+      const body=await response?.json().catch(()=>({}))||{};
+      if(Array.isArray(body.steps)) body.steps.forEach(log);
+      throw new Error(String(body.error||`${label}第 ${index}/${count} 段失敗：HTTP ${response?.status||"未知"}。`));
+    }
+    const range=contentRangeInfo(response.headers.get("Content-Range"));
+    const data=new Uint8Array(await response.arrayBuffer());
+    const expected=rangeEnd-offset+1;
+    if(!range||range.start!==offset||range.end!==rangeEnd||(range.total>0&&range.total!==total)) throw new Error(`${label}第 ${index}/${count} 段 Content-Range 不符。`);
+    if(data.byteLength!==expected) throw new Error(`${label}第 ${index}/${count} 段大小不完整：預期 ${humanBytes(expected)}，實際 ${humanBytes(data.byteLength)}。`);
+    chunks.push(data); received+=data.byteLength; offset=rangeEnd+1;
+    setProgress(start+(end-start)*Math.min(1,received/total),`正在下載${label}：${humanBytes(received)} / ${humanBytes(total)}`);
+    log(`【高畫質同工作階段】${label}第 ${index}/${count} 段完成：${requestedRange}。`);
+  }
+  if(received!==total) throw new Error(`${label}媒體不完整：預期 ${humanBytes(total)}，實際 ${humanBytes(received)}。`);
+  const output=new Uint8Array(received); let position=0;
+  for(const chunk of chunks){output.set(chunk,position);position+=chunk.byteLength;}
+  log(`【媒體完整性】${label}預期：${humanBytes(total)}；實際：${humanBytes(received)}。`);
+  setProgress(end,`${label}下載完成。`);
+  return output;
+}
+async function fetchYoutubeHls(format, label, start, end) {
+  log(`【WEB_SAFARI HLS】${label}開始解析 HLS Media Playlist。`);
+  const playlistResponse=await fetch(endpoint("/youtube-hls-playlist",{url:format.url}),{cache:"no-store",headers:platformRequestHeaders("youtube")});
+  const playlist=await playlistResponse.json().catch(()=>({}));
+  if(!playlistResponse.ok)throw new Error(playlist.error||`HLS Playlist 失敗：HTTP ${playlistResponse.status}。`);
+  const urls=[...(playlist.initUrl?[playlist.initUrl]:[]),...(playlist.segments||[])];
+  const chunks=[];let received=0;
+  for(let index=0;index<urls.length;index++){
+    const response=await fetch(endpoint("/youtube-hls-segment",{url:urls[index]}),{cache:"no-store",headers:platformRequestHeaders("youtube")});
+    if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error||`HLS Segment ${index+1}/${urls.length} 失敗：HTTP ${response.status}。`);}
+    const chunk=new Uint8Array(await response.arrayBuffer());chunks.push(chunk);received+=chunk.byteLength;
+    if(received>MAX_BROWSER_WORK_BYTES)throw new Error("HLS 資料超過瀏覽器安全處理上限。");
+    setProgress(start+(end-start)*((index+1)/urls.length),`WEB_SAFARI HLS：${index+1}/${urls.length}；${humanBytes(received)}`);
+  }
+  const output=new Uint8Array(received);let offset=0;for(const chunk of chunks){output.set(chunk,offset);offset+=chunk.byteLength;}
+  log(`【WEB_SAFARI HLS】${label}完成：${urls.length} 個資源，共 ${humanBytes(received)}。`);return output;
+}
+async function fetchYoutubeSabr(format, label, start, end) {
+  const track = normalizedKind(format) === "僅音訊" ? "audio" : "video";
+  log(`【VISIONOS SABR SESSION】${label}優先沿用解析階段 SABR Context，使用 UMP/SABR 串流下載，itag ${format.itag}；不使用 5 MiB Range。`);
+  const response = await fetch(endpoint("/youtube-sabr-download", {
+    id: state.videoId,
+    itag: format.activeItag || format.itag,
+    track,
+    apiKey: format.refreshApiKey || "",
+    visitorData: format.refreshVisitorData || "",
+    sessionId: format.sessionId || state.ytMediaSessionId || ""
+  }), { cache: "no-store", headers: platformRequestHeaders("youtube") });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    if (Array.isArray(body.steps)) body.steps.forEach(log);
+    throw new Error(body.error || `VISIONOS SABR 下載失敗：HTTP ${response.status}。`);
+  }
+  const expectedBytes = Number(response.headers.get("X-OwO-Expected-Bytes") || format.contentLength || 0);
+  const expectedDurationMs = Number(response.headers.get("X-OwO-Expected-Duration-Ms") || format.approxDurationMs || 0);
+  const trackMode = response.headers.get("X-OwO-Sabr-Track-Mode") || track;
+  log(`【VISIONOS SABR 完整下載】${label}模式：${trackMode}；預期大小：${expectedBytes > 0 ? humanBytes(expectedBytes) : "未知"}；預期時間：${expectedDurationMs > 0 ? `${(expectedDurationMs / 1000).toFixed(2)} 秒` : "未知"}。`);
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error(`VISIONOS SABR ${label}沒有可讀取的串流。`);
+  const chunks=[]; let received=0;
+  while(true){
+    const {done,value}=await reader.read();
+    if(done)break;
+    if(!value?.byteLength)continue;
+    chunks.push(value);
+    received+=value.byteLength;
+    if(received>MAX_BROWSER_WORK_BYTES){await reader.cancel();throw new Error(`${label}超過瀏覽器安全處理上限。`);}
+    const ratio=expectedBytes>0?Math.min(1,received/expectedBytes):0;
+    setProgress(start+(end-start)*ratio,`正在以 VISIONOS SABR 下載${label}：${humanBytes(received)}${expectedBytes>0?` / ${humanBytes(expectedBytes)}`:""}`);
+  }
+  if(expectedBytes>0&&received<expectedBytes){
+    const coverage=received/expectedBytes*100;
+    log(`【VISIONOS SABR 完整性失敗】${label}只收到 ${humanBytes(received)} / ${humanBytes(expectedBytes)}，覆蓋率 ${coverage.toFixed(2)}%。`);
+    throw new Error(`VISIONOS SABR ${label}不完整：只下載 ${coverage.toFixed(2)}%，已停止 FFmpeg 合併。`);
+  }
+  const output=new Uint8Array(received);let offset=0;for(const chunk of chunks){output.set(chunk,offset);offset+=chunk.byteLength;}
+  log(`【VISIONOS SABR 完整性】${label}實際：${humanBytes(received)}；預期：${expectedBytes>0?humanBytes(expectedBytes):"未知"}；驗證通過。`);
+  setProgress(end,`${label}完整下載完成。`);return output;
+}
+async function fetchYoutubeSabrPair(video, audio, start = 3, end = 58) {
+  log(`【VISIONOS SABR 即時雙軌】單一 SABR 工作同時接收視訊 itag ${video.itag} 與音訊 itag ${audio.itag}；播放時鐘依實際經過時間推進。`);
+  const response=await fetch(endpoint("/youtube-sabr-pair-download",{id:state.videoId,videoItag:video.activeItag||video.itag,audioItag:audio.activeItag||audio.itag,apiKey:video.refreshApiKey||audio.refreshApiKey||"",visitorData:video.refreshVisitorData||audio.refreshVisitorData||"",sessionId:video.sessionId||audio.sessionId||state.ytMediaSessionId||""}),{cache:"no-store",headers:platformRequestHeaders("youtube")});
+  if(!response.ok){const body=await response.json().catch(()=>({}));if(Array.isArray(body.steps))body.steps.forEach(log);throw new Error(body.error||`VISIONOS SABR 雙軌下載失敗：HTTP ${response.status}。`);}
+  const expectedVideo=Number(response.headers.get("X-OwO-Expected-Video-Bytes")||video.contentLength||0);
+  const expectedAudio=Number(response.headers.get("X-OwO-Expected-Audio-Bytes")||audio.contentLength||0);
+  const duration=Number(response.headers.get("X-OwO-Expected-Duration-Ms")||video.approxDurationMs||audio.approxDurationMs||0);
+  log(`【VISIONOS SABR 即時雙軌】預期視訊：${expectedVideo?humanBytes(expectedVideo):"未知"}；預期音訊：${expectedAudio?humanBytes(expectedAudio):"未知"}；播放時間：${duration?(duration/1000).toFixed(2)+" 秒":"未知"}。`);
+  const reader=response.body?.getReader();if(!reader)throw new Error("VISIONOS SABR 雙軌回應沒有可讀取串流。");
+  const videoChunks=[],audioChunks=[];let pending=new Uint8Array(0),videoBytes=0,audioBytes=0;
+  while(true){const {done,value}=await reader.read();if(done)break;if(!value?.byteLength)continue;const merged=new Uint8Array(pending.byteLength+value.byteLength);merged.set(pending);merged.set(value,pending.byteLength);let offset=0;while(merged.byteLength-offset>=5){const type=merged[offset],length=new DataView(merged.buffer,merged.byteOffset+offset+1,4).getUint32(0,false);if(merged.byteLength-offset-5<length)break;const chunk=merged.slice(offset+5,offset+5+length);if(type===1){videoChunks.push(chunk);videoBytes+=length;}else if(type===2){audioChunks.push(chunk);audioBytes+=length;}offset+=5+length;}pending=merged.slice(offset);const totalExpected=expectedVideo+expectedAudio,totalReceived=videoBytes+audioBytes;const ratio=totalExpected?Math.min(1,totalReceived/totalExpected):0;setProgress(start+(end-start)*ratio,`SABR 雙軌下載：視訊 ${humanBytes(videoBytes)}；音訊 ${humanBytes(audioBytes)}`);if(totalReceived>MAX_BROWSER_WORK_BYTES)throw new Error("SABR 雙軌資料超過瀏覽器安全處理上限。");}
+  if(pending.byteLength)throw new Error(`SABR 雙軌框架尾端不完整：${pending.byteLength} bytes。`);
+  const videoCoverage=expectedVideo?videoBytes/expectedVideo:1,audioCoverage=expectedAudio?audioBytes/expectedAudio:1;
+  log(`【VISIONOS SABR 雙軌完整性】視訊 ${humanBytes(videoBytes)} / ${expectedVideo?humanBytes(expectedVideo):"未知"}，${(videoCoverage*100).toFixed(2)}%；音訊 ${humanBytes(audioBytes)} / ${expectedAudio?humanBytes(expectedAudio):"未知"}，${(audioCoverage*100).toFixed(2)}%。`);
+  if(videoCoverage<0.995||audioCoverage<0.995)throw new Error(`VISIONOS SABR 雙軌不完整：視訊 ${(videoCoverage*100).toFixed(2)}%，音訊 ${(audioCoverage*100).toFixed(2)}%，已停止 FFmpeg 合併。`);
+  const join=(chunks,total)=>{const out=new Uint8Array(total);let at=0;for(const chunk of chunks){out.set(chunk,at);at+=chunk.byteLength;}return out;};
+  setProgress(end,"SABR 視訊與音訊完整下載完成。");return{videoData:join(videoChunks,videoBytes),audioData:join(audioChunks,audioBytes)};
+}
+async function fetchYoutubeMuxed(format,label,start,end){
+  const total=Number(format.contentLength||0);
+  log(`【影音合一同工作階段】${label}由專用端點重新取得 ANDROID itag ${format.activeItag||format.itag||18} 並立即串流。`);
+  const response=await fetch(endpoint("/youtube-muxed-download",{id:state.videoId,itag:format.activeItag||format.itag||18,apiKey:format.refreshApiKey||"",visitorData:format.refreshVisitorData||""}),{cache:"no-store",headers:platformRequestHeaders("youtube")});
+  if(!response.ok){const body=await response.json().catch(()=>({}));if(Array.isArray(body.steps))body.steps.forEach(log);throw new Error(body.error||`影音合一下載失敗：HTTP ${response.status}。`);}
+  const data=new Uint8Array(await response.arrayBuffer());
+  if(total>0&&data.byteLength!==total)throw new Error(`${label}不完整：預期 ${humanBytes(total)}，實際 ${humanBytes(data.byteLength)}。`);
+  setProgress(end,`${label}下載完成。`); return data;
+}
+
+async function fetchMedia(format, label = "媒體", start = 5, end = 65) {
+  if (state.platform === "youtube") {
+    if (format.protocol === "hls") return fetchYoutubeHls(format, label, start, end);
+    if (format.protocol === "sabr") return fetchYoutubeSabr(format, label, start, end);
+    return normalizedKind(format) === "影音合一" ? fetchYoutubeMuxed(format,label,start,end) : fetchYoutubeMediaInChunks(format,label,start,end);
+  }
+  const response = await fetch(mediaEndpoint(format), { cache: "no-store", headers: platformRequestHeaders() });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    if (Array.isArray(data.steps)) data.steps.forEach(step => log(step));
+    const error = new Error(data.error || `${label}下載失敗：HTTP ${response.status}。`);
+    error.code = data.code || "MEDIA_DOWNLOAD_FAILED";
+    error.httpStatus = response.status;
+    throw error;
+  }
+  const length = Number(response.headers.get("Content-Length") || format.contentLength || 0);
+  if (length > MAX_BROWSER_WORK_BYTES) throw Error(`${label}大小 ${humanBytes(length)} 超過瀏覽器安全處理上限。`);
+  setProgress(start, `正在下載${label}…`);
+  const reader = response.body?.getReader();
+  if (!reader) { const data = new Uint8Array(await response.arrayBuffer()); setProgress(end, `${label}下載完成。`); return data; }
+  const chunks=[]; let received=0;
+  while (true) {
+    const {done,value}=await reader.read(); if (done) break;
+    chunks.push(value); received += value.byteLength;
+    if (received > MAX_BROWSER_WORK_BYTES) { await reader.cancel(); throw Error(`${label}超過瀏覽器安全處理上限。`); }
+    if (length) setProgress(start + (end-start)*(received/length), `正在下載${label}：${humanBytes(received)} / ${humanBytes(length)}`);
+  }
+  const output=new Uint8Array(received); let offset=0; for (const chunk of chunks) { output.set(chunk,offset); offset+=chunk.byteLength; }
+  setProgress(end, `${label}下載完成。`); return output;
+}
+function saveBlob(data, filename, type = "application/octet-stream") {
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const url = URL.createObjectURL(new Blob([bytes], { type }));
+  const anchor = document.createElement("a"); anchor.href=url; anchor.download=filename; anchor.hidden=true;
+  document.body.append(anchor); anchor.click(); anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+async function loadFFmpegModules() {
+  const ffmpegModule = await import(FFMPEG_MODULE_URL);
+  if (!ffmpegModule.FFmpeg) throw Error("專案內 FFmpeg ES Module 載入內容不完整。");
+  return { FFmpeg: ffmpegModule.FFmpeg };
+}
+
+async function ensureFFmpeg() {
+  if (state.ffmpegLoaded && state.ffmpeg) return state.ffmpeg;
+  if (state.ffmpegLoading) return state.ffmpegLoading;
+  state.ffmpegLoading = (async () => {
+    status("首次使用，正在載入專案內 FFmpeg WebAssembly…", "working");
+    log("【FFMPEG】從專案內同源 FFmpeg 目錄載入主 Worker、Core JS 與 WASM。");
+    const { FFmpeg } = await loadFFmpegModules();
+    const ffmpeg = new FFmpeg();
+    ffmpeg.on("log", ({ message }) => message && log(`【FFMPEG】${message}`));
+    ffmpeg.on("progress", ({ progress }) => Number.isFinite(progress) && setProgress(65 + Math.max(0,Math.min(1,progress))*30, "正在執行瀏覽器影音處理…"));
+    try {
+      const coreURL = `${FFMPEG_CORE_BASE}/ffmpeg-core.js`;
+      const wasmURL = `${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`;
+      log(`【FFMPEG 載入】Class Worker：${FFMPEG_CLASS_WORKER_URL}。`);
+      log(`【FFMPEG 載入】ES Module Core：${coreURL}。`);
+      log(`【FFMPEG 載入】WebAssembly：${wasmURL}。`);
+      await ffmpeg.load({ classWorkerURL: FFMPEG_CLASS_WORKER_URL, coreURL, wasmURL });
+    } catch (reason) {
+      try { ffmpeg.terminate(); } catch {}
+      const detail = reason instanceof Error ? reason.message : typeof reason === "string" ? reason : JSON.stringify(reason ?? null);
+      throw new Error(`FFmpeg 載入失敗：${detail || "Worker 未提供錯誤內容"}`);
+    }
+    state.ffmpeg=ffmpeg; state.ffmpegLoaded=true; log("【FFMPEG】單執行緒核心載入完成。"); return ffmpeg;
+  })();
+  try { return await state.ffmpegLoading; } finally { state.ffmpegLoading=null; }
+}
+async function directDownload() {
+  const format=selected("directFormat"); if (!format) throw Error("沒有可下載的完整影片格式。");
+  const data=await fetchMedia(format,"完整影片",5,92); setProgress(100,"下載完成，正在儲存檔案…");
+  saveBlob(data,`${mediaFileStem(format)}.${format.container || "mp4"}`,format.mimeType || "video/mp4"); log(`直接下載完成：${format.quality}/${format.container}。`);
+}
+async function mergeDownload() {
+  const video=selected("videoFormat"), audio=selected("audioFormat");
+  if (!video || !audio) throw Error("高畫質合併需要視訊與音訊格式。");
+  const estimated=(bytes(video)+bytes(audio))*3; if (estimated > MAX_BROWSER_WORK_BYTES) throw Error(`預估合併記憶體 ${humanBytes(estimated)} 超過安全上限。`);
+  log("【高畫質下載】採循序下載，避免視訊與音訊同時觸發媒體網址刷新與 HTTP 429。");
+  let videoData;
+  let audioData;
+  try {
+    if(video.protocol === "sabr" && audio.protocol === "sabr") {
+      const pair = await fetchYoutubeSabrPair(video, audio, 3, 58);
+      videoData = pair.videoData;
+      audioData = pair.audioData;
+    } else {
+      videoData = await fetchMedia(video,"高畫質視訊",3,31);
+      audioData = await fetchMedia(audio,"音訊",32,58);
+    }
+  } catch (error) {
+    const direct = lists().muxed[0];
+    if (direct) {
+      log(`【工作階段隔離】高畫質下載失敗，但 ${direct.quality || "360p"} · ${(direct.container || "mp4").toUpperCase()} 基本格式仍保留，可切換「直接下載」後重試。`);
+      setMode("direct");
+      status(`高畫質下載失敗；已保留 ${direct.quality || "360p"} 直接下載。`, "error");
+    }
+    throw error;
+  }
+  const ffmpeg=await ensureFFmpeg(); const videoExt=video.container || "mp4", audioExt=audio.container || "m4a";
+  const v=`input-video.${videoExt}`, a=`input-audio.${audioExt}`, o="merged-video.mp4";
+  await ffmpeg.writeFile(v,videoData); await ffmpeg.writeFile(a,audioData);
+  setProgress(65,"正在合併視訊與音訊…");
+  let copied=true;
+  try { await ffmpeg.exec(["-i",v,"-i",a,"-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","aac","-b:a","192k","-movflags","+faststart",o]); }
+  catch { copied=false; await ffmpeg.exec(["-i",v,"-i",a,"-map","0:v:0","-map","1:a:0","-c:v","libx264","-preset","veryfast","-c:a","aac","-b:a","192k","-movflags","+faststart",o]); }
+  const output=await ffmpeg.readFile(o); await Promise.allSettled([ffmpeg.deleteFile(v),ffmpeg.deleteFile(a),ffmpeg.deleteFile(o)]);
+  setProgress(100,"高畫質合併完成，正在儲存檔案…"); saveBlob(output,`${mediaFileStem(video)}.mp4`,"video/mp4"); log(`高畫質合併完成：${copied ? "保留原始視訊" : "相容性轉碼"}。`);
+}
+
+async function prepareCompleteVideoForAudio(format, start = 2, end = 56) {
+  if (!format) throw Error("沒有可處理音訊的影片格式。");
+  const mediaData = await fetchMedia(format, "影片", start, end);
+  const estimated = mediaData.byteLength * 3;
+  if (estimated > MAX_BROWSER_WORK_BYTES) {
+    throw Error(`預估音訊處理記憶體約 ${humanBytes(estimated)}，超過瀏覽器安全上限。請選擇較小的影片格式。`);
+  }
+  return mediaData;
+}
+
+function selectedMp3Bitrate() {
+  const allowed = new Set([128, 192, 256, 320]);
+  const value = Number($("mp3Bitrate").value);
+  return allowed.has(value) ? value : 192;
+}
+
+function updateMp3BitrateUi() {
+  const bitrate = selectedMp3Bitrate();
+  const descriptions = {
+    128: "節省容量，適合語音與一般行動聆聽。",
+    192: "適合一般聆聽與檔案大小平衡。",
+    256: "較高音質，適合音樂保存。",
+    320: "最高位元率，檔案容量也最大。"
+  };
+  $("mp3BitrateHelp").textContent = `目前選擇：${bitrate} kbps，${descriptions[bitrate]}`;
+  $("convertMp3").querySelector("span").textContent = `轉換音訊 MP3｜${bitrate} kbps`;
+}
+
+async function convertWav() {
+  if (state.busy) return;
+  const format = selected("directFormat");
+  if (!format) {
+    status("沒有可轉換音訊的影片格式。", "error");
+    return;
+  }
+  try {
+    state.busy = true;
+    updateButton();
+    status("正在下載影片並轉換為 WAV…", "working");
+    log(`開始將影片音訊轉換為 WAV：${format.quality}/${format.container}。`);
+    const mediaData = await prepareCompleteVideoForAudio(format);
+    const estimatedWavBytes = mediaData.byteLength * 5;
+    if (estimatedWavBytes > MAX_BROWSER_WORK_BYTES) {
+      throw Error(`WAV 為未壓縮格式，預估處理記憶體約 ${humanBytes(estimatedWavBytes)}，超過瀏覽器安全上限。請選擇較小的影片格式。`);
+    }
+    const ffmpeg = await ensureFFmpeg();
+    const inputExt = format.container || "mp4";
+    const inputName = `wav-source.${inputExt}`;
+    const outputName = "converted-audio.wav";
+    await ffmpeg.writeFile(inputName, mediaData);
+    setProgress(70, "正在將音訊轉換為 WAV…");
+    await ffmpeg.exec([
+      "-i", inputName,
+      "-map", "0:a:0",
+      "-vn",
+      "-c:a", "pcm_s16le",
+      "-ar", "44100",
+      "-ac", "2",
+      outputName
+    ]);
+    const output = await ffmpeg.readFile(outputName);
+    await Promise.allSettled([ffmpeg.deleteFile(inputName), ffmpeg.deleteFile(outputName)]);
+    if (!output || !output.length) throw Error("影片中沒有可轉換的音訊軌。");
+    setProgress(100, "WAV 轉換完成，正在儲存檔案…");
+    saveBlob(output, `${mediaFileStem(format)}-audio.wav`, "audio/wav");
+    status("WAV 轉換完成，檔案已交給瀏覽器儲存。", "success");
+    log("WAV 轉換完成：PCM 16-bit、44.1 kHz、立體聲。");
+  } catch (error) {
+    const message = String(error.message || error).includes("matches no streams")
+      ? "影片中沒有可轉換的音訊軌。"
+      : String(error.message || error);
+    status(message, "error");
+    log(`WAV 轉換失敗：${message}`);
+  } finally {
+    state.busy = false;
+    updateButton();
+  }
+}
+
+async function convertMp3() {
+  if (state.busy) return;
+  const format = selected("directFormat");
+  if (!format) {
+    status("沒有可轉換音訊的影片格式。", "error");
+    return;
+  }
+  try {
+    state.busy = true;
+    updateButton();
+    status("正在下載影片並轉換為 MP3…", "working");
+    log(`開始將影片音訊轉換為 MP3：${format.quality}/${format.container}。`);
+    const bitrate = selectedMp3Bitrate();
+    const mediaData = await prepareCompleteVideoForAudio(format);
+    const ffmpeg = await ensureFFmpeg();
+    const inputExt = format.container || "mp4";
+    const inputName = `mp3-source.${inputExt}`;
+    const outputName = "converted-audio.mp3";
+    await ffmpeg.writeFile(inputName, mediaData);
+    setProgress(70, "正在將音訊轉換為 MP3…");
+    await ffmpeg.exec([
+      "-i", inputName,
+      "-map", "0:a:0",
+      "-vn",
+      "-c:a", "libmp3lame",
+      "-b:a", `${bitrate}k`,
+      "-ar", "44100",
+      "-ac", "2",
+      outputName
+    ]);
+    const output = await ffmpeg.readFile(outputName);
+    await Promise.allSettled([ffmpeg.deleteFile(inputName), ffmpeg.deleteFile(outputName)]);
+    if (!output || !output.length) throw Error("影片中沒有可轉換的音訊軌。");
+    setProgress(100, "MP3 轉換完成，正在儲存檔案…");
+    saveBlob(output, `${mediaFileStem(format)}-audio-${bitrate}kbps.mp3`, "audio/mpeg");
+    status("MP3 轉換完成，檔案已交給瀏覽器儲存。", "success");
+    log(`MP3 轉換完成：${bitrate} kbps、44.1 kHz、立體聲。`);
+  } catch (error) {
+    const message = String(error.message || error).includes("matches no streams")
+      ? "影片中沒有可轉換的音訊軌。"
+      : String(error.message || error);
+    status(message, "error");
+    log(`MP3 轉換失敗：${message}`);
+  } finally {
+    state.busy = false;
+    updateButton();
+  }
+}
+
+async function extractAudio() {
+  if (state.busy) return;
+  const format = selected("directFormat");
+  if (!format) {
+    status("沒有可提取音訊的完整影片格式。", "error");
+    return;
+  }
+  try {
+    state.busy = true;
+    updateButton();
+    status("正在下載完整影片並提取音訊…", "working");
+    log(`開始從完整影片提取音訊：${format.quality}/${format.container}。`);
+    const mediaData = await prepareCompleteVideoForAudio(format, 2, 58);
+    const ffmpeg = await ensureFFmpeg();
+    const inputExt = format.container || "mp4";
+    const inputName = `audio-source.${inputExt}`;
+    const outputName = "extracted-audio.m4a";
+    await ffmpeg.writeFile(inputName, mediaData);
+    setProgress(72, "正在從完整影片提取音訊…");
+    let copied = true;
+    try {
+      await ffmpeg.exec(["-i", inputName, "-map", "0:a:0", "-vn", "-c:a", "copy", outputName]);
+    } catch {
+      copied = false;
+      await ffmpeg.exec(["-i", inputName, "-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "192k", outputName]);
+    }
+    const output = await ffmpeg.readFile(outputName);
+    await Promise.allSettled([ffmpeg.deleteFile(inputName), ffmpeg.deleteFile(outputName)]);
+    if (!output || !output.length) throw Error("完整影片中沒有可提取的音訊軌。");
+    setProgress(100, "音訊提取完成，正在儲存 M4A…");
+    saveBlob(output, `${mediaFileStem(format)}-audio.m4a`, "audio/mp4");
+    status("音訊提取完成，M4A 已交給瀏覽器儲存。", "success");
+    log(`音訊提取完成：${copied ? "保留原始音訊品質" : "轉換為 AAC 192 kbps"}。`);
+  } catch (error) {
+    status(error.message.includes("matches no streams") ? "完整影片內沒有可提取的音訊軌。" : error.message, "error");
+    log(`音訊提取失敗：${error.message}`);
+  } finally {
+    state.busy = false;
+    updateButton();
+  }
+}
+
+async function download() {
+  if (state.busy) return;
+  try {
+    state.busy = true; updateButton();
+    status(state.mode === "hq" ? "正在準備高畫質下載與合併…" : "正在下載影片…", "working");
+    await (state.mode === "hq" ? mergeDownload() : directDownload());
+    status("處理完成，檔案已交給瀏覽器儲存。", "success");
+  } catch (error) {
+    status(error.message, "error"); log(`【處理失敗】${error.message}`);
+  } finally { state.busy = false; updateButton(); }
+}
+
+$("analyze").onclick = analyze;
+$("download").onclick = download;
+$("extractAudio").onclick = extractAudio;
+$("convertMp3").onclick = convertMp3;
+$("convertWav").onclick = convertWav;
+$("mp3Bitrate").onchange = updateMp3BitrateUi;
+updateMp3BitrateUi();
+$("youtubeUrl").onkeydown = event => { if (event.key === "Enter") analyze(); };
+async function copyCompleteLog() {
+  const text = $("log").textContent || "";
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.left = "-9999px";
+      document.body.append(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      textarea.remove();
+      if (!copied) throw Error("瀏覽器未完成複製動作。");
+    }
+    status("「執行紀錄」已複製。", "success");
+  } catch (error) {
+    status(`複製執行紀錄失敗：${String(error.message || error)}`, "error");
+  }
+}
+$("copyLog").onclick = copyCompleteLog;
+$("clearLog").onclick = () => $("log").textContent = "尚未執行。";
+$("videoFormat").onchange = updateButton;
+$("audioFormat").onchange = updateButton;
+$("directFormat").onchange = updateButton;
+$("ytCookieForm").onsubmit = event => { event.preventDefault(); applyYtCookie(); };
+$("clearYtCookie").onclick = clearYtCookie;
+$("toggleYtCookie").onclick = () => {
+  const input = $("ytCookie");
+  input.type = input.type === "password" ? "text" : "password";
+  $("toggleYtCookie").textContent = input.type === "password" ? "顯示" : "隱藏";
+};
+$("fbCookieForm").onsubmit = event => { event.preventDefault(); applyFbCookie(); };
+$("clearFbCookie").onclick = clearFbCookie;
+$("toggleFbCookie").onclick = () => {
+  const input = $("fbCookie");
+  input.type = input.type === "password" ? "text" : "password";
+  $("toggleFbCookie").textContent = input.type === "password" ? "顯示" : "隱藏";
+};
+$("igCookieForm").onsubmit = event => { event.preventDefault(); applySocialCookie("instagram"); };
+$("clearIgCookie").onclick = () => clearSocialCookie("instagram");
+$("thCookieForm").onsubmit = event => { event.preventDefault(); applySocialCookie("threads"); };
+$("clearThCookie").onclick = () => clearSocialCookie("threads");
+for (const prefix of ["ig", "th"]) {
+  $(`toggle${prefix === "ig" ? "Ig" : "Th"}Cookie`).onclick = () => {
+    const input = $(`${prefix}Cookie`);
+    input.type = input.type === "password" ? "text" : "password";
+  };
+}
+document.querySelectorAll(".mode").forEach(button => button.onclick = () => setMode(button.dataset.mode));
+$("youtubeAutoRetry").checked=localStorage.getItem("youtubeAutoRetry")==="1";$("youtubeRetryLimit").value=localStorage.getItem("youtubeRetryLimit")||"3";youtubeRetryLimit();$("youtubeAutoRetry").onchange=()=>localStorage.setItem("youtubeAutoRetry",$("youtubeAutoRetry").checked?"1":"0");$("youtubeRetryLimit").onchange=()=>{const value=youtubeRetryLimit();localStorage.setItem("youtubeRetryLimit",String(value));};$("youtubeRetryLimit").onblur=$("youtubeRetryLimit").onchange;
+$("worker").value = localStorage.getItem("workerUrl") || DEFAULT_WORKER_URL;
